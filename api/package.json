@@ -1,0 +1,9 @@
+{
+  "name": "the-mudda-radio-api",
+  "version": "1.0.0",
+  "description": "Azure Functions backend for The Mudda Radio (radio.themudda.com) — a 24x7 Hindi civic-commentary station.",
+  "main": "playlist/index.js",
+  "dependencies": {
+    "@azure/storage-blob": "^12.17.0"
+  }
+}
