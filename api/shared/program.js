@@ -79,47 +79,94 @@ function selectEditorials(index) {
   return out;
 }
 
-// Synthesise one segment, tolerating TTS hiccups so a cold build never aborts
-// midway — a skipped section just fills in on the next scheduled refresh (each
-// clip is content-hash cached, so nothing is ever re-synthesised twice).
-async function synthSeg(kind, text, meta, log) {
-  const clean = (text || '').trim();
-  if (!clean) return null;
-  try {
-    return await voiceSeg(kind, clean, meta);
-  } catch (e) {
-    log(`  ! skipped ${kind} (${String((meta && meta.title) || '').slice(0, 40)}): ${e.message}`);
-    return null;
-  }
+// Shape one manifest entry from a ready (cached or freshly voiced) clip.
+function shapeSeg(kind, name, text, meta, bytes, cached) {
+  return {
+    id: name,
+    kind,
+    cat: meta.cat || null,
+    verdictHi: meta.verdictHi || '',
+    title: meta.title || '',
+    titleHi: meta.titleHi || '',
+    source: meta.source || '',
+    link: meta.link || '',
+    beat: meta.beat || '',
+    text,
+    audio: `/api/audio/${name}.mp3`,
+    durationMs: tts.durationFromBytes(bytes),
+    cached: !!cached,
+  };
 }
 
-// Build + persist the full program. Returns the manifest.
+// Build + persist the program. Bounded + resumable: the F0 free tier rate-limits
+// synthesis (~20 calls/60s) and the SWA gateway caps a request at ~45s, so a
+// cold program of ~40 segments cannot be voiced in one request. Each run voices
+// at most `maxNew` not-yet-cached clips (within a wall-clock budget), assembles
+// the playlist from whatever audio is ready, and defers editorials whose audio
+// is still warming. Repeated refreshes (manual + the 3-hourly cron) converge to
+// the full program; every clip is content-hash cached, so nothing is voiced
+// twice and a warm cache reassembles instantly.
 async function buildProgram(opts = {}) {
   const log = opts.log || (() => {});
+  const maxNew = Math.max(1, parseInt(opts.maxNew || process.env.RADIO_MAX_NEW || '14', 10));
+  const budgetMs = Math.max(10000, parseInt(opts.budgetMs || process.env.RADIO_BUDGET_MS || '36000', 10));
+  const started = Date.now();
+  const overBudget = () => (Date.now() - started) > budgetMs;
+
   const index = await fetchIndex();
   const picks = selectEditorials(index);
   log(`selected ${picks.length} editorials (index: ${(index.editorials || []).length} total)`);
   if (!picks.length) throw new Error('no editorials from feed');
 
-  const hourSeed = Math.floor(Date.now() / 3600000);
-  const segments = [];
-  let newest = 0;
-
-  // Opening station ident.
-  segments.push(await voiceSeg('ident', pick(BUMPERS.ident, hourSeed), { title: STATION }));
-
-  let aired = 0;
-  for (let i = 0; i < picks.length; i++) {
-    const meta = picks[i];
-    let blob;
+  // Load the full bodies up front (cheap HTTP, no synthesis).
+  const eds = [];
+  for (const meta of picks) {
     try {
-      blob = await fetchEditorial(meta.slug);
+      const blob = await fetchEditorial(meta.slug);
+      if (blob && blob.slug) eds.push({ meta, blob });
     } catch (e) {
       log(`  ! could not load editorial ${meta.slug}: ${e.message}`);
-      continue;
     }
-    if (!blob || !blob.slug) continue;
+  }
+  if (!eds.length) throw new Error('no editorial bodies from feed');
 
+  const hourSeed = Math.floor(Date.now() / 3600000);
+  let made = 0;            // new (paid) synth calls this run
+  let budgetHit = false;
+
+  // Return a ready manifest entry for this text, or null. Cache first; only
+  // spend a synth call (and only while under the per-run cap + time budget) when
+  // the clip isn't cached yet. Never throws — a hiccup just defers the clip to a
+  // later refresh.
+  async function ensureSeg(kind, text, meta) {
+    const clean = String(text || '').trim();
+    if (!clean) return null;
+    const name = tts.clipName(clean, tts.VOICE_DEFAULT);
+    try {
+      const info = await store.audioInfo(name);
+      if (info && info.exists && info.size > 0) return shapeSeg(kind, name, clean, meta, info.size, true);
+    } catch (e) { /* fall through and try to synthesise */ }
+    if (made >= maxNew || overBudget()) { budgetHit = true; return null; }
+    try {
+      const out = await tts.speak(clean);
+      made++;
+      return shapeSeg(kind, out.name, clean, meta, out.bytes, out.cached);
+    } catch (e) {
+      log(`  ! skipped ${kind} (${String((meta && meta.title) || '').slice(0, 40)}): ${e.message}`);
+      return null;
+    }
+  }
+
+  const segments = [];
+  let aired = 0;
+  let pending = 0;
+  let newest = 0;
+
+  const ident = await ensureSeg('ident', pick(BUMPERS.ident, hourSeed), { title: STATION });
+  if (ident) segments.push(ident);
+
+  for (let i = 0; i < eds.length; i++) {
+    const { meta, blob } = eds[i];
     const verdict = blob.verdict || meta.verdict || 'concern';
     const headline = blob.headline || meta.headline || '';
     const baseMeta = {
@@ -131,12 +178,7 @@ async function buildProgram(opts = {}) {
       beat: blob.beat || (Array.isArray(blob.tags) ? blob.tags[0] : '') || '',
     };
 
-    // Segue before each editorial except the first one aired.
-    if (aired > 0) {
-      segments.push(await voiceSeg('segue', pick(BUMPERS.segue, hourSeed + i), { title: STATION }));
-    }
-
-    // Voice the whole editorial: opening (headline + dek) → each section → pullquote.
+    // The full editorial: opening (headline + dek) → each section → pullquote.
     const beats = [];
     beats.push([editorialOpen(blob), firstSentence(blob.headlineHi || blob.dekHi)]);
     for (const sec of (blob.sections || [])) {
@@ -145,25 +187,37 @@ async function buildProgram(opts = {}) {
     const pull = pullLine(blob);
     if (pull) beats.push([pull, firstSentence(blob.headlineHi)]);
 
-    let any = false;
-    let synthCount = 0;
+    // Keep the editorial atomic: only air it once ALL its audio is ready, so a
+    // listener never hears a clipped argument. Missing beats are still voiced
+    // (up to the cap) so the editorial completes on a later refresh.
+    const beatSegs = [];
+    let complete = true;
     for (const [text, titleHi] of beats) {
-      const seg = await synthSeg('story', text, { ...baseMeta, titleHi }, log);
-      if (!seg) continue;
-      segments.push(seg);
-      any = true;
-      if (!seg.cached) { synthCount++; await sleep(150); }
+      const seg = await ensureSeg('story', text, { ...baseMeta, titleHi });
+      if (seg) beatSegs.push(seg);
+      else complete = false;
     }
-    if (any) {
+
+    if (complete && beatSegs.length) {
+      if (aired > 0) {
+        const segue = await ensureSeg('segue', pick(BUMPERS.segue, hourSeed + i), { title: STATION });
+        if (segue) segments.push(segue);
+      }
+      segments.push(...beatSegs);
       aired++;
       newest = Math.max(newest, blob.ts || meta.ts || 0);
-      log(`  [${aired}/${picks.length}] ${(headline || '').slice(0, 50)} · ${(blob.sections || []).length} sections · ${synthCount} synth`);
+      log(`  [${aired}] ${(headline || '').slice(0, 50)} · ${beatSegs.length} segs`);
+    } else {
+      pending++;
+      log(`  … warming "${(headline || '').slice(0, 40)}" (${beatSegs.length}/${beats.length} ready)`);
     }
   }
-  if (!aired) throw new Error('no editorial audio produced');
 
   // Sign-off, then the player loops back to the ident.
-  segments.push(await voiceSeg('signoff', pick(BUMPERS.signoff, hourSeed), { title: STATION }));
+  const signoff = await ensureSeg('signoff', pick(BUMPERS.signoff, hourSeed), { title: STATION });
+  if (signoff) segments.push(signoff);
+
+  if (!segments.length) throw new Error('no editorial audio produced yet');
 
   const program = {
     station: STATION,
@@ -172,33 +226,16 @@ async function buildProgram(opts = {}) {
     updatedAt: new Date().toISOString(),
     source: EDITORIAL_INDEX,
     newsUpdatedAt: newest ? new Date(newest).toISOString() : null,
+    partial: pending > 0 || budgetHit,
+    aired,
+    pending,
     count: segments.length,
     totalDurationMs: segments.reduce((a, s) => a + (s.durationMs || 0), 0),
     segments,
   };
   await store.writeProgram(program);
-  log(`program written: ${segments.length} segments · ${Math.round(program.totalDurationMs / 1000)}s total`);
+  log(`program written: ${segments.length} segs · ${aired} editorials aired · ${pending} warming · ${made} new synths · ${Math.round(program.totalDurationMs / 1000)}s`);
   return program;
-}
-
-// Synthesise one segment and shape its manifest entry.
-async function voiceSeg(kind, text, meta = {}) {
-  const out = await tts.speak(text);
-  return {
-    id: out.name,
-    kind,
-    cat: meta.cat || null,
-    verdictHi: meta.verdictHi || '',
-    title: meta.title || '',
-    titleHi: meta.titleHi || '',
-    source: meta.source || '',
-    link: meta.link || '',
-    beat: meta.beat || '',
-    text,
-    audio: out.audio,
-    durationMs: out.durationMs,
-    cached: out.cached,
-  };
 }
 
 module.exports = { buildProgram, selectEditorials, fetchIndex, fetchEditorial, N_EDITORIALS };

@@ -20,6 +20,9 @@ module.exports = async function (context, req) {
       body: JSON.stringify({
         ok: true,
         segments: program.count,
+        aired: program.aired,
+        pending: program.pending,
+        partial: program.partial,
         totalDurationMs: program.totalDurationMs,
         newsUpdatedAt: program.newsUpdatedAt,
         builtInMs: Date.now() - started,
