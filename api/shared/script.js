@@ -56,6 +56,30 @@ function takeLine(take) {
   return sanitize(lead + body);
 }
 
+// Compose the spoken OPENING line for an editorial: civic lead-in + headline + dek.
+function editorialOpen(ed) {
+  const lead = VERDICT_LEAD[ed && ed.verdict] || LEAD_DEFAULT;
+  const head = sanitize(ed && (ed.headlineHi || ed.headline) || '');
+  const dek = sanitize(ed && (ed.dekHi || ed.dek) || '');
+  if (!head) return '';
+  return sanitize(lead + head + (dek ? '। ' + dek : ''));
+}
+
+// Compose the spoken line for one editorial section: optional heading + paragraph.
+function sectionLine(sec) {
+  const h = sanitize(sec && (sec.hHi || sec.h) || '');
+  const p = sanitize(sec && (sec.pHi || sec.p) || '');
+  if (!p) return '';
+  return sanitize(h ? h + '। ' + p : p);
+}
+
+// The bebaak closing punch — the editorial's pullquote, read as the last beat.
+function pullLine(ed) {
+  const q = sanitize(ed && (ed.pullquoteHi || ed.pullquote) || '');
+  if (!q) return '';
+  return sanitize('और हमारी बेबाक राय यही है — ' + q);
+}
+
 // Pre-written station bumpers (no LLM). Idents open the hour, segues bridge
 // takes, the sign-off plays just before the loop restarts.
 const BUMPERS = {
@@ -84,5 +108,6 @@ function pick(arr, seed) {
 
 module.exports = {
   sanitize, firstSentence, takeLine, pick,
+  editorialOpen, sectionLine, pullLine,
   VERDICT_LEAD, VERDICT_HI, BUMPERS,
 };
